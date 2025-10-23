@@ -88,6 +88,27 @@ def resolve_slot(slot: Slot, rounds: List[Round]) -> Slot:
         if m.winner:
             return Slot(id=m.winner.id, name=m.winner.name)
     return Slot(id="tbd", name="TBD")
+# --- Adaptive helpers ---
+def name_to_scariness(name: str) -> float:
+    """
+    Deterministic 0..1 'scariness' based on name. More vowels & harsh consonants
+    tend to tip it up a bit, but it's primarily a stable hash.
+    """
+    base = sum(ord(c) for c in name.lower()) % 1000 / 1000.0
+    vowel_boost = sum(c in "aeiouy" for c in name.lower()) * 0.01
+    harsh = sum(c in "xzkrgqw" for c in name.lower()) * 0.008
+    return max(0.05, min(0.95, base * 0.7 + vowel_boost + harsh))
+
+def longest_success_streak(attempts: List["Attempt"]) -> int:
+    """Longest contiguous streak where the Macho Man is scared (runs_away or runs_away_crying)."""
+    best = cur = 0
+    for a in attempts:
+        if a.outcome in ("runs_away", "runs_away_crying"):
+            cur += 1
+            best = max(best, cur)
+        else:
+            cur = 0
+    return best
 
 SAMPLE_CRYPTIDS = [
     ("Mothman","A winged, red-eyed harbinger of doom."),
@@ -145,25 +166,28 @@ def build_rounds(entrants: List[Entrant]) -> List[Round]:
 # --------------------------
 def prompt_man(attacker_name: str, attacker_blurb: str) -> str:
     return textwrap.dedent(f"""
-    You are simulating a horror-scare attempt sequence. Return STRICT JSON only per the provided schema.
+    You are simulating a 10-attempt scare sequence where BOTH sides learn and adapt.
+    Return STRICT JSON only (see schema).
 
     Attacker: {attacker_name}. Description: {attacker_blurb or "(no extra lore)"}.
-    Target: A lone, rage-prone macho man sitting on a park bench at night with his dog.
-    Tone: PG-13. Absolutely no gore. Keep notes brief and cinematic with occasional dry, dark humor.
+    Defender: The Macho Man (rage-prone) on a park bench at night with his dog and a thermos of tea.
+    Tone: spooky, cinematic, dark humor allowed; PG-13; absolutely no gore.
 
-    Rules: 10 independent attempts. For each attempt choose exactly one outcome from this list (lowercase, exact match):
-    - runs_away
-    - runs_away_crying
-    - defends
-    - stays_put
-    - walks_away
+    Dynamics to model across attempts:
+    - The Macho Man becomes harder to scare over time (confidence, familiarity).
+    - The attacker adapts tactics attempt-by-attempt (varied approaches; cunning when needed).
+    - Early success is possible, but later the defender may resist or fight back unless the attacker changes strategy.
+    - Each attempt must feel unique (no repeated phrasing).
 
-    Scoring (FYI): runs_away=+1, runs_away_crying=+2, defends=-1, stays_put=-2, walks_away=0.
+    Outcomes (exact lowercase):
+      runs_away, runs_away_crying, defends, stays_put, walks_away
+    Scoring: runs_away=+1, runs_away_crying=+2, defends=-1, stays_put=-2, walks_away=0.
 
     JSON schema:
     {{
       "attempts": [
-        {{ "attempt": 1, "outcome": "runs_away" | "runs_away_crying" | "defends" | "stays_put" | "walks_away", "notes": "short vivid note" }}
+        {{ "attempt": 1, "outcome": "runs_away" | "runs_away_crying" | "defends" | "stays_put" | "walks_away",
+           "notes": "short vivid unique sentence (spooky, with occasional dry, dark humor)" }}
       ],
       "highlights": {{
         "most_successful": "",
@@ -176,26 +200,27 @@ def prompt_man(attacker_name: str, attacker_blurb: str) -> str:
 
 def prompt_vs(attacker: str, a_blurb: str, defender: str, d_blurb: str) -> str:
     return textwrap.dedent(f"""
-    You are simulating a cryptid scaring another cryptid. Return STRICT JSON only.
+    You are simulating a 10-attempt duel where BOTH cryptids learn and adapt.
+    Return STRICT JSON only.
 
-    Scenario: A night-time park bench. The defender ({defender}) is seated alone on the bench. The attacker ({attacker}) tries to scare them away.
+    Scene: a night-time park bench. The defender ({defender}) sits; the attacker ({attacker}) tries to scare them away.
     Attacker description: {a_blurb or "(no extra lore)"}.
     Defender description: {d_blurb or "(no extra lore)"}.
-    Tone: PG-13. Absolutely no gore. Keep notes brief and cinematic with occasional dry, dark humor.
+    Tone: spooky, cinematic, dark humor allowed; PG-13; absolutely no gore.
 
-    Rules: 10 independent attempts. For each attempt choose exactly one outcome (exact lowercase):
-    - runs_away
-    - runs_away_crying
-    - defends
-    - stays_put
-    - walks_away
+    Dynamics across attempts:
+    - Both sides adapt tactics over time; early success may lead to counters later.
+    - Each attempt must feel unique (no repeated phrasing).
 
-    Scoring (FYI): runs_away=+1, runs_away_crying=+2, defends=-1, stays_put=-2, walks_away=0.
+    Outcomes (exact lowercase):
+      runs_away, runs_away_crying, defends, stays_put, walks_away
+    Scoring: runs_away=+1, runs_away_crying=+2, defends=-1, stays_put=-2, walks_away=0.
 
     JSON schema:
     {{
       "attempts": [
-        {{ "attempt": 1, "outcome": "runs_away" | "runs_away_crying" | "defends" | "stays_put" | "walks_away", "notes": "short vivid note" }}
+        {{ "attempt": 1, "outcome": "runs_away" | "runs_away_crying" | "defends" | "stays_put" | "walks_away",
+           "notes": "short vivid unique sentence (spooky, with occasional dry, dark humor)" }}
       ],
       "highlights": {{
         "most_successful": "",
@@ -205,6 +230,7 @@ def prompt_vs(attacker: str, a_blurb: str, defender: str, d_blurb: str) -> str:
 
     Respond with JSON only.
     """).strip()
+
 
 def openai_chat(api_key: str, prompt: str, model: str = "gpt-4o-mini", temperature: float = 0.7) -> SimJSON:
     url = "https://api.openai.com/v1/chat/completions"
@@ -234,68 +260,122 @@ def openai_chat(api_key: str, prompt: str, model: str = "gpt-4o-mini", temperatu
     return SimJSON(attempts=attempts, highlights=highlights)
 
 def offline_sim(name: str) -> SimJSON:
-    atts = []
+    scariness = name_to_scariness(name)          # 0..1
+    man_nerve = 0.15                              # starts kind of shaky
+    learn_bonus = 0.0                             # cryptid learns from failures
+    tactic_cycle = 0                               # switch tactics periodically
+
+    attempts: List[Attempt] = []
+    rng = random.random
+
     for i in range(10):
-        r = random.random()
-        if r < 0.15:
-            oc = "runs_away_crying"
-            note = f"{name} whispers a name from the void; the target bolts sobbing"
-        elif r < 0.45:
-            oc = "runs_away"
-            note = f"{name} looms from fog; the target sprints"
-        elif r < 0.7:
-            oc = "walks_away"
-            note = f"{name} rattles a sign; the target just stands and leaves"
-        elif r < 0.9:
-            oc = "defends"
-            note = f"{name} gets pelted with the man's thermos"
+        # Early attempts: higher fear factor if scariness is high; Macho Man stiffens each round
+        # Cryptid "learning" grants a small bonus after weak outcomes
+        attack_variation = (0.05 * ((i % 3) == tactic_cycle))  # occasional tactic effectiveness
+        fear = scariness * (1.0 - 0.05 * i) + learn_bonus + attack_variation - man_nerve
+
+        # Map fear to outcome probabilities
+        # Highly positive fear -> crying/run; slightly positive -> run/walk; negative -> defend/stay
+        if fear > 0.35:
+            # strong scare
+            p_cry = min(0.25 + scariness * 0.3, 0.6)
+            if rng() < p_cry:
+                oc = "runs_away_crying"
+            else:
+                oc = "runs_away"
+        elif fear > 0.1:
+            # mild scare
+            oc = "runs_away" if rng() < (0.55 + scariness * 0.2) else "walks_away"
+        elif fear > -0.1:
+            # stalemate-ish
+            oc = "walks_away" if rng() < 0.5 else "defends"
         else:
-            oc = "stays_put"
-            note = f"{name} flickers; the target stays stubbornly seated"
-        atts.append(Attempt(attempt=i+1, outcome=oc, notes=note))
-    most = next((a.notes for a in atts if a.outcome == "runs_away_crying"), None) \
-        or next((a.notes for a in atts if a.outcome == "runs_away"), atts[0].notes)
-    least = next((a.notes for a in reversed(atts) if a.outcome in ("stays_put","defends")), atts[-1].notes)
-    return SimJSON(attempts=atts, highlights={"most_successful": most, "least_successful": least})
+            # the Macho Man is emboldened
+            oc = "defends" if rng() < (0.65 + man_nerve * 0.2) else "stays_put"
+
+        # Narrative micro-note (varied)
+        if oc == "runs_away_crying":
+            note = f"{name} finds a pressure point in the night; The Macho Man flees weeping."
+        elif oc == "runs_away":
+            note = f"{name} surfaces from fog; The Macho Man sprints like pride owes interest."
+        elif oc == "walks_away":
+            note = f"{name} rattles the hush; The Macho Man stands and leaves, offended at ambiance."
+        elif oc == "defends":
+            note = f"{name} advances; The Macho Man counters with thermos and unlicensed bravado."
+        else:  # stays_put
+            note = f"{name} whispers close; The Macho Man tightens his jaw and refuses to budge."
+
+        attempts.append(Attempt(attempt=i+1, outcome=oc, notes=note))
+
+        # Learning dynamics for next attempt
+        scared = (oc in ("runs_away", "runs_away_crying"))
+        if scared:
+            # The Macho Man gets tougher after being scared; cryptid loses a bit of easy edge
+            man_nerve = min(0.6, man_nerve + 0.08)
+            learn_bonus = max(0.0, learn_bonus - 0.02)
+        else:
+            # The Macho Man's nerve plateaus or grows slightly slower
+            man_nerve = min(0.75, man_nerve + (0.04 if oc == "defends" else 0.02))
+            # The cryptid adapts after neutral/failed outcomes
+            learn_bonus = min(0.25, learn_bonus + (0.04 if oc in ("stays_put","defends") else 0.02))
+
+        # shift tactic cycle occasionally to simulate “changing tactics”
+        if (i+1) % 3 == 0:
+            tactic_cycle = (tactic_cycle + 1) % 3
+
+    # highlights
+    most = next((a.notes for a in attempts if a.outcome == "runs_away_crying"), None) \
+        or next((a.notes for a in attempts if a.outcome == "runs_away"), attempts[0].notes)
+    least = next((a.notes for a in reversed(attempts) if a.outcome in ("stays_put","defends")), attempts[-1].notes)
+    return SimJSON(
+        attempts=attempts,
+        highlights={
+            "most_successful": most,
+            "least_successful": least,
+            "longest_streak": longest_success_streak(attempts),  # extra field we use in prose
+        }
+    )
 
 # --------------------------
-# Narrative builders (spooky + clear scoring)
 # --------------------------
+# Narrative builders (adaptive + clear scoring)
+# --------------------------
+OUTCOME_SCORE_NOTE = "Scoring: runs_away=+1, runs_away_crying=+2, defends=-1, stays_put=-2, walks_away=0."
+
+# Varied sentences per outcome (used to keep attempts unique even offline)
 OUTCOME_SENTENCES = {
     "runs_away": [
-        "The Macho Man bolts, sprinting like cardio finally found religion.",
-        "The Macho Man breaks into a panicked 5K, no medal ceremony required.",
-        "The Macho Man abandons the bench with the dignity of a fast-moving shopping cart."
+        "The Macho Man bolts, deciding pride can catch up later.",
+        "The Macho Man chooses cardio over courage, a rare victory for his sneakers.",
+        "The Macho Man abandons the bench like it suddenly charges rent."
     ],
     "runs_away_crying": [
-        "The Macho Man flees in tears—salt water meets sweat in an unholy sports drink.",
-        "The Macho Man sprints away bawling; even the dog averts its eyes.",
-        "The Macho Man escapes, sobbing into the night like a siren with gym membership."
+        "The Macho Man flees weeping—electrolytes by sorrow.",
+        "The Macho Man sprints away bawling; the dog pretends not to know him.",
+        "The Macho Man escapes, sobbing like an air-raid siren with feelings."
     ],
     "defends": [
-        "The Macho Man hurls a thermos with MLB aspirations.",
-        "The Macho Man squares up—thermos first, feelings second.",
-        "The Macho Man counterattacks with commuter-grade artillery."
+        "The Macho Man counters with thermos and bravado; OSHA would object.",
+        "The Macho Man squares up; etiquette sits this one out.",
+        "The Macho Man throws first and thinks later; the thermos files a complaint."
     ],
     "stays_put": [
-        "The Macho Man sits immovable, patron saint of Stubborn Benches.",
-        "The Macho Man refuses to budge; gravity files an alliance.",
-        "The Macho Man remains seated, an oak with opinions."
+        "The Macho Man refuses to budge, a monument to stubborn furniture.",
+        "The Macho Man plants himself like an oak that pays taxes.",
+        "The Macho Man remains seated; even the breeze takes the hint."
     ],
     "walks_away": [
-        "The Macho Man stands and leaves like he’s quitting a bad movie.",
-        "The Macho Man wanders off, the world’s pettiest protest march of one.",
-        "The Macho Man drifts away, offended in slow motion."
+        "The Macho Man stands and leaves, offended by the atmosphere.",
+        "The Macho Man wanders off, a one-man protest against vibes.",
+        "The Macho Man drifts away, schedule suddenly overbooked."
     ],
 }
 
-OUTCOME_SCORE_NOTE = "Scoring: runs_away=+1, runs_away_crying=+2, defends=-1, stays_put=-2, walks_away=0."
-
-def unique_sentence(outcome: Outcome, i: int) -> str:
+def _unique_sentence(outcome: Outcome, i: int) -> str:
     bank = OUTCOME_SENTENCES[outcome]
     return bank[i % len(bank)]
 
-def tallies_to_string(t: Counter) -> str:
+def _tallies(t: Counter) -> str:
     order = ["runs_away_crying","runs_away","walks_away","defends","stays_put"]
     labels = {
         "runs_away": "runs away",
@@ -308,17 +388,13 @@ def tallies_to_string(t: Counter) -> str:
     return ", ".join(parts) if parts else "no notable reactions"
 
 def attempt_lines(attempts: List[Attempt], attacker: str, defender_label: str) -> str:
-    # longform, one unique sentence per attempt + the model’s short note
     lines = []
     for idx, a in enumerate(attempts, start=1):
-        sentence = unique_sentence(a.outcome, idx)
-        # put the attacker up front; always refer to the target as The Macho Man (or defender_label in finals)
-        if defender_label == "The Macho Man":
-            perspective = f"**Attempt {idx}** — {attacker} advances; {sentence}"
-        else:
-            perspective = f"**Attempt {idx}** — {attacker} advances on {defender_label}; {sentence}"
-        # include the sim’s concise note for flavor
-        lines.append(f"- {perspective} _({a.notes})._")
+        # emphasize adaptation in phrasing every few attempts
+        evolve = " (new tactic)" if idx in (3,6,9) else ""
+        sentence = _unique_sentence(a.outcome, idx)
+        lead = f"**Attempt {idx}** — {attacker} advances{evolve}; {sentence}"
+        lines.append(f"- {lead} _({a.notes})._")
     return "\n".join(lines)
 
 def round_match_narrative(A, B, details: MatchDetails, is_final: bool, round_number: Optional[int] = None) -> str:
@@ -326,19 +402,23 @@ def round_match_narrative(A, B, details: MatchDetails, is_final: bool, round_num
         t = Counter([a.outcome for a in details.aLog.attempts])
         score = details.scoreA
         attempts_text = attempt_lines(details.aLog.attempts, A.name, "The Macho Man")
-        tally = tallies_to_string(t)
+        tally = _tallies(t)
+        streak = details.highlights.get("longest_streak") if details.highlights else None
+        if streak is None:
+            streak = longest_success_streak(details.aLog.attempts)
 
-        # Summary block FIRST, then story
         header = f"### Round {round_number}: **{A.name} vs The Macho Man**"
         summary = (
             f"**Overview (10 attempts):** {tally} → **Score {score}**  \n"
+            f"**Longest scare streak:** {streak}  \n"
             f"{OUTCOME_SCORE_NOTE}\n\n"
             f"**Best moment:** {details.highlights.get('aBest') or 'A rumor crawls under the skin; sprinting ensues.'}  \n"
             f"**Tough moment:** {details.highlights.get('aWorst') or 'A thermos achieves escape velocity.'}"
         )
-        prose_intro = (
-            f"Night swallows the park. **{A.name}** steps from the margins of folklore, aiming all dread at "
-            f"**The Macho Man**, who clutches his thermos like it’s certified ghost-proof. The dog provides moral support and unhelpful commentary."
+        flavor = (
+            "Night leans in. **The Macho Man** sits with dog and thermos, rage on a hair-trigger. "
+            f"**{A.name}** opens with bold horrors then pivots as resistance grows—"
+            "cunning where brute dread stalls, misdirection when bravado stiffens."
         )
         result_line = f"**Result:** {'**'+A.name+'** advances.' if details.winnerId == A.id else '**'+B.name+'** advances.'}"
 
@@ -347,7 +427,7 @@ def round_match_narrative(A, B, details: MatchDetails, is_final: bool, round_num
 
         {summary}
 
-        {prose_intro}
+        {flavor}
 
         {attempts_text}
 
@@ -357,20 +437,19 @@ def round_match_narrative(A, B, details: MatchDetails, is_final: bool, round_num
         # Final: both attack each other
         tA = Counter([a.outcome for a in details.aLog.attempts])
         tB = Counter([a.outcome for a in (details.bLog.attempts if details.bLog else [])])
-
         a_lines = attempt_lines(details.aLog.attempts, A.name, B.name)
         b_lines = attempt_lines(details.bLog.attempts if details.bLog else [], B.name, A.name) if details.bLog else ""
 
         header = f"### Final: **{A.name} vs {B.name}**"
         overview = (
             f"**Tallies (10 attempts each):**  \n"
-            f"- {A.name}: {tallies_to_string(tA)} → **Score {details.scoreA}**  \n"
-            f"- {B.name}: {tallies_to_string(tB)} → **Score {details.scoreB}**  \n"
+            f"- {A.name}: {_tallies(tA)} → **Score {details.scoreA}**  \n"
+            f"- {B.name}: {_tallies(tB)} → **Score {details.scoreB}**  \n"
             f"{OUTCOME_SCORE_NOTE}"
         )
         flavor = (
-            f"Under trees that remember older fears, the bench hosts an ego summit. "
-            f"**{A.name}** and **{B.name}** trade hauntings like collectors swapping cursed stamps."
+            "The bench becomes an arena for veteran tricksters. Each learns the other’s rhythm—"
+            "feints turn to counters; counters turn to calamities."
         )
         best = (
             f"**Best moments:**  \n"
@@ -468,6 +547,17 @@ def simulate_round(round_index: int, entrants: List[Entrant], rounds: List[Round
 # --------------------------
 st.set_page_config(page_title="Cryptid Scare Bracket (Streamlit)", page_icon="👻", layout="wide")
 st.title("👻 Cryptid Scare Bracket")
+# — World intro (appears once at the top) —
+st.markdown("""
+> **Welcome to the Spooky Night League.**  
+> Somewhere in the park, a rage-prone mortal known only as **The Macho Man** (Randy, to his dog) guards a splintery throne: a public bench.  
+> Thermos of hot tea? Check. Questionable life choices? Double check.  
+> In the hedges, cryptids gather—hungry not for flesh, but for **seating**.  
+> Every matchup sends a creature to challenge **The Macho Man** in ten escalating attempts.  
+> Early horrors may win sprints, but The Macho Man catches on, and stubborn pride grows with each scare—  
+> the best monsters **learn** from past attempts.  
+> Win your round. Claim the bench. Advance.
+""")
 
 with st.sidebar:
     st.header("Simulation Settings")
@@ -592,6 +682,15 @@ def render_match(m: Match, rounds: List[Round], is_final: bool):
                         highlight(f"**{B.name} – Tough moment:** {d.highlights['bWorst']}")
 
         st.success(f"Winner: {m.winner.name}")
+        streak_note = ""
+if d and d.aLog and hasattr(d.aLog, "attempts"):
+    streak_val = d.highlights.get("longest_streak") if d.highlights else None
+    if streak_val is None:
+        streak_val = longest_success_streak(d.aLog.attempts)
+    streak_note = f" • Longest scare streak: {streak_val}"
+if m.winner:
+    st.caption((m.summary if is_final else f"{A.name} vs The Macho Man: {d.scoreA if d else 0} pts.") + (streak_note or ""))
+
 
 # --------------------------
 # Results + Bracket + Next button in one band (top)
