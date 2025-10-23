@@ -553,6 +553,45 @@ with col_run:
     st.button("Reset tournament", type="secondary", on_click=lambda: (
         st.session_state.update({"entrants": [], "rounds": [], "curr_round_idx": None, "narratives_log": []})
     ))
+# --------------------------
+# Bracket rendering helpers
+# --------------------------
+def highlight(text: str):
+    st.markdown(
+        "<div style='background:#10151d;border-radius:10px;padding:8px;font-size:12px;color:#d7e0ea;'>"
+        + text +
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+def render_match(m: Match, rounds: List[Round], is_final: bool):
+    A = resolve_slot(m.a, rounds)
+    B = resolve_slot(m.b, rounds)
+
+    st.markdown(f"**{A.name}** vs **{B.name}**")
+    if m.winner:
+        # show short summary line that matches our new copy
+        st.caption(
+            m.summary if is_final
+            else f"{A.name} vs The Macho Man: {m.details.scoreA if m.details else 0} pts."
+        )
+
+        d = m.details
+        if d:
+            c1, c2 = st.columns(2)
+            with c1:
+                if d.highlights.get("aBest"):
+                    highlight(f"**{A.name} – Best:** {d.highlights['aBest']}")
+                if d.highlights.get("aWorst"):
+                    highlight(f"**{A.name} – Tough moment:** {d.highlights['aWorst']}")
+            with c2:
+                if is_final:
+                    if d.highlights.get("bBest"):
+                        highlight(f"**{B.name} – Best:** {d.highlights['bBest']}")
+                    if d.highlights.get("bWorst"):
+                        highlight(f"**{B.name} – Tough moment:** {d.highlights['bWorst']}")
+
+        st.success(f"Winner: {m.winner.name}")
 
 # --------------------------
 # Results + Bracket + Next button in one band (top)
