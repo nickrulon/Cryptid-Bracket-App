@@ -659,37 +659,41 @@ def render_match(m: Match, rounds: List[Round], is_final: bool):
     B = resolve_slot(m.b, rounds)
 
     st.markdown(f"**{A.name}** vs **{B.name}**")
-    if m.winner:
-        # show short summary line that matches our new copy
-        st.caption(
-            m.summary if is_final
-            else f"{A.name} vs The Macho Man: {m.details.scoreA if m.details else 0} pts."
-        )
+    d = m.details
 
-        d = m.details
+    if m.winner:
+        # Build one caption line (summary + optional streak)
+        streak_note = ""
+        if d and getattr(d, "aLog", None) and getattr(d.aLog, "attempts", None):
+            streak_val = (d.highlights or {}).get("longest_streak") if hasattr(d, "highlights") else None
+            if streak_val is None:
+                try:
+                    streak_val = longest_success_streak(d.aLog.attempts)
+                except Exception:
+                    streak_val = None
+            if streak_val is not None:
+                streak_note = f" • Longest scare streak: {streak_val}"
+
+        summary_line = m.summary if is_final else f"{A.name} vs The Macho Man: {d.scoreA if d else 0} pts."
+        st.caption(summary_line + (streak_note or ""))
+
+        # Highlights
         if d:
             c1, c2 = st.columns(2)
             with c1:
-                if d.highlights.get("aBest"):
+                if d.highlights and d.highlights.get("aBest"):
                     highlight(f"**{A.name} – Best:** {d.highlights['aBest']}")
-                if d.highlights.get("aWorst"):
+                if d.highlights and d.highlights.get("aWorst"):
                     highlight(f"**{A.name} – Tough moment:** {d.highlights['aWorst']}")
             with c2:
-                if is_final:
+                if is_final and d.highlights:
                     if d.highlights.get("bBest"):
                         highlight(f"**{B.name} – Best:** {d.highlights['bBest']}")
                     if d.highlights.get("bWorst"):
                         highlight(f"**{B.name} – Tough moment:** {d.highlights['bWorst']}")
 
         st.success(f"Winner: {m.winner.name}")
-        streak_note = ""
-if d and d.aLog and hasattr(d.aLog, "attempts"):
-    streak_val = d.highlights.get("longest_streak") if d.highlights else None
-    if streak_val is None:
-        streak_val = longest_success_streak(d.aLog.attempts)
-    streak_note = f" • Longest scare streak: {streak_val}"
-if m.winner:
-    st.caption((m.summary if is_final else f"{A.name} vs The Macho Man: {d.scoreA if d else 0} pts.") + (streak_note or ""))
+
 
 
 # --------------------------
