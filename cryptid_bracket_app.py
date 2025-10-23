@@ -1,606 +1,471 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
-import { Label } from "@/components/ui/label";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Switch } from "@/components/ui/switch";
-import { AlertCircle, Brackets, Ghost, KeyRound, Play, Settings2, Swords, Trophy, Trash2, Upload, Download } from "lucide-react";
+import json, math, random, textwrap, time
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Literal
+import requests
+import streamlit as st
 
-/**
- * Cryptid Scare Bracket — single-file React app
- * -------------------------------------------------
- * What this does
- * - Lets users enter cryptids (name + optional blurb)
- * - Supports Small (8) or Large (16) single-elimination brackets
- * - Generates bracket, simulates each matchup round-by-round
- * - Scores per rules; final is monster-vs-monster
- * - Uses OpenAI Chat Completions (JSON mode) OR an offline simulator
- * - Pretty UI using Tailwind + shadcn/ui
- *
- * Notes
- * - Store your OpenAI API key locally (Settings) — for demo use only
- * - You can test everything with the Offline Simulator (no API key required)
- */
-
-/** @typedef {{ id: string, name: string, blurb?: string }} Cryptid */
-/** @typedef {{ name: string, seed: number, id: string, blurb?: string }} Entrant */
-/** @typedef {{ roundIndex: number, matchIndex: number, slot: "A"|"B" }} FromRef */
-/** @typedef {{ name?: string, id?: string, from?: FromRef }} Slot */
-/** @typedef {{ id: string, a: Slot, b: Slot, winner?: Slot & { scoreA?: number, scoreB?: number, summary?: string }, details?: MatchDetails }} Match */
-/** @typedef {{ matches: Match[] }} Round */
-
-/** Outcome scoring map */
-const SCORE_MAP = {
-  runs_away: 1,
-  runs_away_crying: 2,
-  defends: -1,
-  stays_put: -2,
-  walks_away: 0,
-} as const;
-
-/** Allowed outcomes */
-const OUTCOMES = Object.keys(SCORE_MAP);
-
-/** @typedef {{
- *  attempts: { attempt: number, outcome: keyof typeof SCORE_MAP, notes: string }[],
- *  highlights?: { most_successful?: string, least_successful?: string }
- * }} SimulationJSON
- */
-
-/** @typedef {{
- *  aLog: SimulationJSON,
- *  bLog?: SimulationJSON, // present in final when both sides attack
- *  scoreA: number,
- *  scoreB: number,
- *  winnerId: string,
- *  highlights: { aBest?: string, aWorst?: string, bBest?: string, bWorst?: string },
- * }} MatchDetails */
-
-function uid(prefix = "id") { return `${prefix}_${Math.random().toString(36).slice(2, 9)}`; }
-function shuffle(arr) { return [...arr].sort(() => Math.random() - 0.5); }
-
-function computeScore(log /** @type {SimulationJSON} */) {
-  return log.attempts.reduce((sum, a) => sum + (SCORE_MAP[a.outcome] ?? 0), 0);
+# --------------------------
+# Types & constants
+# --------------------------
+Outcome = Literal["runs_away","runs_away_crying","defends","stays_put","walks_away"]
+SCORE_MAP: Dict[Outcome, int] = {
+    "runs_away": 1,
+    "runs_away_crying": 2,
+    "defends": -1,
+    "stays_put": -2,
+    "walks_away": 0,
 }
+OUTCOMES = list(SCORE_MAP.keys())
 
-function outcomeLabel(key) {
-  switch (key) {
-    case "runs_away": return "runs away";
-    case "runs_away_crying": return "runs away crying";
-    case "defends": return "defends himself";
-    case "stays_put": return "stays put";
-    case "walks_away": return "walks away";
-    default: return key;
-  }
-}
+@dataclass
+class Attempt:
+    attempt: int
+    outcome: Outcome
+    notes: str
 
-const SAMPLE_CRYPTIDS = [
-  { name: "Mothman", blurb: "A winged, red-eyed harbinger of doom." },
-  { name: "Bigfoot", blurb: "Massive, elusive primate in North American woods." },
-  { name: "Loch Ness Monster", blurb: "Shy lake-dweller with a serpentine silhouette." },
-  { name: "Chupacabra", blurb: "Spiny-backed livestock drainer from the dark." },
-  { name: "Jersey Devil", blurb: "Hooved, winged shrieker of Pine Barrens lore." },
-  { name: "Wendigo", blurb: "Gaunt, ravenous spirit of endless winter hunger." },
-  { name: "Kraken", blurb: "A titanic tentacled terror from the deep." },
-  { name: "Yeti", blurb: "Snowbound colossus with a thunderous roar." },
-  { name: "Banshee", blurb: "Wailing omen whose cry chills the marrow." },
-  { name: "Mokele-mbembe", blurb: "Swamp-bound sauropod of whispered sightings." },
-  { name: "Skinwalker", blurb: "Shapeshifting mimic with malevolent intent." },
-  { name: "Thunderbird", blurb: "Storm-calling avian giant with shadowed wings." },
-  { name: "Shadow Person", blurb: "A living absence lurking at the edge of sight." },
-  { name: "Bunyip", blurb: "Billabong beast with a dreadful bellow." },
-  { name: "Mongolian Death Worm", blurb: "Arid burrower rumored to spit lightning." },
-  { name: "Spring-Heeled Jack", blurb: "Grinning leaper cloaked in coal-smoke." },
-];
+@dataclass
+class SimJSON:
+    attempts: List[Attempt]
+    highlights: Dict[str, Optional[str]] = field(default_factory=dict)
 
-/** Build bracket rounds from entrants (8 or 16 only) */
-function buildRounds(entrants /** @type {Entrant[]} */) {
-  const n = entrants.length; // 8 or 16
-  const rounds = [];
-  const totalRounds = Math.log2(n);
-  const firstRoundMatches = n / 2;
+@dataclass
+class Entrant:
+    id: str
+    name: str
+    blurb: str = ""
+    seed: int = 0
 
-  // Round 0 — pair sequentially
-  const r0 = { matches: [] };
-  for (let i = 0; i < firstRoundMatches; i++) {
-    const a = entrants[i * 2];
-    const b = entrants[i * 2 + 1];
-    r0.matches.push({ id: uid("m"), a: { name: a.name, id: a.id }, b: { name: b.name, id: b.id } });
-  }
-  rounds.push(r0);
+@dataclass
+class Slot:
+    id: Optional[str] = None
+    name: Optional[str] = None
+    from_round: Optional[int] = None
+    from_match: Optional[int] = None
 
-  // Subsequent rounds — references to prior winners
-  for (let r = 1; r < totalRounds; r++) {
-    const prev = rounds[r - 1];
-    const m = { matches: [] };
-    for (let i = 0; i < prev.matches.length / 2; i++) {
-      m.matches.push({
-        id: uid("m"),
-        a: { from: { roundIndex: r - 1, matchIndex: i * 2, slot: "A" } },
-        b: { from: { roundIndex: r - 1, matchIndex: i * 2 + 1, slot: "B" } },
-      });
+@dataclass
+class MatchDetails:
+    aLog: SimJSON
+    bLog: Optional[SimJSON]
+    scoreA: int
+    scoreB: int
+    winnerId: str
+    highlights: Dict[str, Optional[str]]
+
+@dataclass
+class Match:
+    id: str
+    a: Slot
+    b: Slot
+    winner: Optional[Slot] = None
+    summary: str = ""
+    details: Optional[MatchDetails] = None
+
+@dataclass
+class Round:
+    matches: List[Match]
+
+# --------------------------
+# Helpers
+# --------------------------
+def uid(prefix="id"):
+    return f"{prefix}_{random.randrange(1_000_000):06d}"
+
+def shuffle(seq):
+    s = list(seq)
+    random.shuffle(s)
+    return s
+
+def compute_score(sim: SimJSON) -> int:
+    return sum(SCORE_MAP[a.outcome] for a in sim.attempts)
+
+def resolve_slot(slot: Slot, rounds: List[Round]) -> Slot:
+    if slot.name and slot.id:
+        return slot
+    if slot.from_round is not None and slot.from_match is not None:
+        m = rounds[slot.from_round].matches[slot.from_match]
+        if m.winner:
+            return Slot(id=m.winner.id, name=m.winner.name)
+    return Slot(id="tbd", name="TBD")
+
+SAMPLE_CRYPTIDS = [
+    ("Mothman","A winged, red-eyed harbinger of doom."),
+    ("Bigfoot","Massive, elusive primate in North American woods."),
+    ("Loch Ness Monster","Shy lake-dweller with a serpentine silhouette."),
+    ("Chupacabra","Spiny-backed livestock drainer from the dark."),
+    ("Jersey Devil","Hooved, winged shrieker of Pine Barrens lore."),
+    ("Wendigo","Gaunt, ravenous spirit of endless winter hunger."),
+    ("Kraken","A titanic tentacled terror from the deep."),
+    ("Yeti","Snowbound colossus with a thunderous roar."),
+    ("Banshee","Wailing omen whose cry chills the marrow."),
+    ("Mokele-mbembe","Swamp-bound sauropod of whispered sightings."),
+    ("Skinwalker","Shapeshifting mimic with malevolent intent."),
+    ("Thunderbird","Storm-calling avian giant with shadowed wings."),
+    ("Shadow Person","A living absence lurking at the edge of sight."),
+    ("Bunyip","Billabong beast with a dreadful bellow."),
+    ("Mongolian Death Worm","Arid burrower rumored to spit lightning."),
+    ("Spring-Heeled Jack","Grinning leaper cloaked in coal-smoke."),
+]
+
+# --------------------------
+# Bracket construction
+# --------------------------
+def build_rounds(entrants: List[Entrant]) -> List[Round]:
+    n = len(entrants)
+    total = int(math.log2(n))
+    rounds: List[Round] = []
+
+    # Round 0 pairings (sequential)
+    r0_matches = []
+    for i in range(0, n, 2):
+        a, b = entrants[i], entrants[i+1]
+        r0_matches.append(Match(
+            id=uid("m"),
+            a=Slot(id=a.id, name=a.name),
+            b=Slot(id=b.id, name=b.name),
+        ))
+    rounds.append(Round(matches=r0_matches))
+
+    # Follow-on rounds reference previous winners
+    for r in range(1, total):
+        prev = rounds[r-1]
+        matches = []
+        for i in range(0, len(prev.matches), 2):
+            matches.append(Match(
+                id=uid("m"),
+                a=Slot(from_round=r-1, from_match=i),
+                b=Slot(from_round=r-1, from_match=i+1),
+            ))
+        rounds.append(Round(matches=matches))
+    return rounds
+
+# --------------------------
+# Prompts & OpenAI call
+# --------------------------
+def prompt_man(attacker_name: str, attacker_blurb: str) -> str:
+    return textwrap.dedent(f"""
+    You are simulating a horror-scare attempt sequence. Return STRICT JSON only per the provided schema.
+
+    Attacker: {attacker_name}. Description: {attacker_blurb or "(no extra lore)"}.
+    Target: A lone, rage-prone macho man sitting on a park bench at night with his dog.
+    Tone: PG-13. Absolutely no gore. Keep notes brief and cinematic.
+
+    Rules: 10 independent attempts. For each attempt choose exactly one outcome from this list (lowercase, exact match):
+    - runs_away
+    - runs_away_crying
+    - defends
+    - stays_put
+    - walks_away
+
+    Scoring (FYI): runs_away=+1, runs_away_crying=+2, defends=-1, stays_put=-2, walks_away=0.
+
+    JSON schema:
+    {{
+      "attempts": [
+        {{ "attempt": 1, "outcome": "runs_away" | "runs_away_crying" | "defends" | "stays_put" | "walks_away", "notes": "short vivid note" }}
+      ],
+      "highlights": {{
+        "most_successful": "",
+        "least_successful": ""
+      }}
+    }}
+
+    Respond with JSON only.
+    """).strip()
+
+def prompt_vs(attacker: str, a_blurb: str, defender: str, d_blurb: str) -> str:
+    return textwrap.dedent(f"""
+    You are simulating a cryptid scaring another cryptid. Return STRICT JSON only.
+
+    Scenario: A night-time park bench. The defender ({defender}) is seated alone on the bench. The attacker ({attacker}) tries to scare them away.
+    Attacker description: {a_blurb or "(no extra lore)"}.
+    Defender description: {d_blurb or "(no extra lore)"}.
+    Tone: PG-13. Absolutely no gore. Keep notes brief and cinematic.
+
+    Rules: 10 independent attempts. For each attempt choose exactly one outcome (exact lowercase):
+    - runs_away
+    - runs_away_crying
+    - defends
+    - stays_put
+    - walks_away
+
+    Scoring (FYI): runs_away=+1, runs_away_crying=+2, defends=-1, stays_put=-2, walks_away=0.
+
+    JSON schema:
+    {{
+      "attempts": [
+        {{ "attempt": 1, "outcome": "runs_away" | "runs_away_crying" | "defends" | "stays_put" | "walks_away", "notes": "short vivid note" }}
+      ],
+      "highlights": {{
+        "most_successful": "",
+        "least_successful": ""
+      }}
+    }}
+
+    Respond with JSON only.
+    """).strip()
+
+def openai_chat(api_key: str, prompt: str, model: str = "gpt-4o-mini", temperature: float = 0.7) -> SimJSON:
+    url = "https://api.openai.com/v1/chat/completions"
+    body = {
+        "model": model,
+        "temperature": temperature,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": "You are an impartial simulation engine. Always return STRICT JSON that matches the schema with allowed outcome values only."},
+            {"role": "user", "content": prompt}
+        ],
     }
-    rounds.push(m);
-  }
-  return rounds;
-}
+    r = requests.post(url, headers={
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }, json=body, timeout=60)
+    r.raise_for_status()
+    content = r.json()["choices"][0]["message"]["content"]
+    # Parse & validate
+    raw = json.loads(content)
+    attempts = []
+    for i, a in enumerate(raw.get("attempts", []), start=1):
+        oc = a["outcome"]
+        if oc not in OUTCOMES:
+            raise ValueError(f"Bad outcome at attempt {i}: {oc}")
+        attempts.append(Attempt(attempt=a.get("attempt", i), outcome=oc, notes=a.get("notes","")))
+    highlights = raw.get("highlights", {})
+    return SimJSON(attempts=attempts, highlights=highlights)
 
-/** Resolve a slot into an entrant name/id using rounds */
-function resolveSlot(slot /** @type {Slot} */, rounds /** @type {Round[]} */) {
-  if (slot?.name && slot?.id) return slot;
-  if (slot?.from) {
-    const { roundIndex, matchIndex } = slot.from;
-    const m = rounds[roundIndex]?.matches[matchIndex];
-    if (m?.winner) return { name: m.winner.name, id: m.winner.id };
-  }
-  return { name: "TBD", id: "tbd" };
-}
+def offline_sim(name: str) -> SimJSON:
+    atts = []
+    for i in range(10):
+        r = random.random()
+        if r < 0.15:
+            oc = "runs_away_crying"
+            note = f"{name} whispers a name from the void; the target bolts sobbing"
+        elif r < 0.45:
+            oc = "runs_away"
+            note = f"{name} looms from fog; the target sprints"
+        elif r < 0.7:
+            oc = "walks_away"
+            note = f"{name} rattles a sign; the target just stands and leaves"
+        elif r < 0.9:
+            oc = "defends"
+            note = f"{name} gets pelted with the man's thermos"
+        else:
+            oc = "stays_put"
+            note = f"{name} flickers; the target stays stubbornly seated"
+        atts.append(Attempt(attempt=i+1, outcome=oc, notes=note))
+    # simple highlights
+    most = next((a.notes for a in atts if a.outcome == "runs_away_crying"), None) \
+        or next((a.notes for a in atts if a.outcome == "runs_away"), atts[0].notes)
+    least = next((a.notes for a in reversed(atts) if a.outcome in ("stays_put","defends")), atts[-1].notes)
+    return SimJSON(attempts=atts, highlights={"most_successful": most, "least_successful": least})
 
-/** Prompt builders */
-function promptForManScenario(attacker /** @type {Slot} */, attackerBlurb /** @type {string} */) {
-  return `You are simulating a horror-scare attempt sequence. Return STRICT JSON only per the provided schema.\n\nAttacker: ${attacker.name}. Description: ${attackerBlurb || "(no extra lore)"}.\nTarget: A lone, rage-prone macho man sitting on a park bench at night with his dog.\nTone: PG-13. Absolutely no gore. Keep notes brief and cinematic.\n\nRules: 10 independent attempts. For each attempt choose exactly one outcome from this list (lowercase, exact match):\n- runs_away\n- runs_away_crying\n- defends\n- stays_put\n- walks_away\n\nScoring (FYI): runs_away=+1, runs_away_crying=+2, defends=-1, stays_put=-2, walks_away=0.\n\nJSON schema:\n{\n  "attempts": [\n    { "attempt": 1, "outcome": "runs_away" | "runs_away_crying" | "defends" | "stays_put" | "walks_away", "notes": "short vivid note" }\n  ],\n  "highlights": {\n    "most_successful": "",\n    "least_successful": ""\n  }\n}\n\nRespond with JSON only.`;
-}
+# --------------------------
+# Simulation driver
+# --------------------------
+def simulate_tournament(entrants: List[Entrant], use_offline: bool, api_key: str, model: str, temperature: float):
+    rounds = build_rounds(entrants)
+    # map id->blurb
+    blurbs = {e.id: e.blurb for e in entrants}
 
-function promptForMonsterVsMonster(a /** @type {Slot} */, aBlurb /** @type {string} */, b /** @type {Slot} */, bBlurb /** @type {string} */) {
-  return `You are simulating a cryptid scaring another cryptid. Return STRICT JSON only.\n\nScenario: A night-time park bench. The defender (${b.name}) is seated alone on the bench. The attacker (${a.name}) tries to scare them away.\nAttacker description: ${aBlurb || "(no extra lore)"}.\nDefender description: ${bBlurb || "(no extra lore)"}.\nTone: PG-13. Absolutely no gore. Keep notes brief and cinematic.\n\nRules: 10 independent attempts. For each attempt choose exactly one outcome (exact lowercase):\n- runs_away\n- runs_away_crying\n- defends\n- stays_put\n- walks_away\n\nScoring (FYI): runs_away=+1, runs_away_crying=+2, defends=-1, stays_put=-2, walks_away=0.\n\nJSON schema:\n{\n  "attempts": [\n    { "attempt": 1, "outcome": "runs_away" | "runs_away_crying" | "defends" | "stays_put" | "walks_away", "notes": "short vivid note" }\n  ],\n  "highlights": {\n    "most_successful": "",\n    "least_successful": ""\n  }\n}\n\nRespond with JSON only.`;
-}
+    for r_idx, rnd in enumerate(rounds):
+        is_final = (r_idx == len(rounds)-1)
+        for m_idx, match in enumerate(rnd.matches):
+            A = resolve_slot(match.a, rounds)
+            B = resolve_slot(match.b, rounds)
+            # Run sim(s)
+            if not is_final:
+                if use_offline:
+                    aLog = offline_sim(A.name)
+                else:
+                    aLog = openai_chat(api_key, prompt_man(A.name, blurbs.get(A.id,"")), model, temperature)
+                scoreA = compute_score(aLog)
+                scoreB = 0
+                # Winner logic (A vs bench)
+                if scoreA > 0:
+                    winner = A
+                elif scoreA == 0:
+                    winner = A if random.random() < 0.5 else B
+                else:
+                    winner = B
+                match.details = MatchDetails(
+                    aLog=aLog, bLog=None, scoreA=scoreA, scoreB=scoreB,
+                    winnerId=winner.id,
+                    highlights={"aBest": aLog.highlights.get("most_successful"),
+                                "aWorst": aLog.highlights.get("least_successful"),
+                                "bBest": None, "bWorst": None}
+                )
+                match.winner = Slot(id=winner.id, name=winner.name)
+                match.summary = f"{A.name} vs bench: {scoreA} pts."
+            else:
+                # Final: A scares B and B scares A
+                if use_offline:
+                    aLog = offline_sim(A.name)
+                    bLog = offline_sim(B.name)
+                else:
+                    aLog = openai_chat(api_key, prompt_vs(A.name, blurbs.get(A.id,""), B.name, blurbs.get(B.id,"")), model, temperature)
+                    bLog = openai_chat(api_key, prompt_vs(B.name, blurbs.get(B.id,""), A.name, blurbs.get(A.id,"")), model, temperature)
+                scoreA = compute_score(aLog)
+                scoreB = compute_score(bLog)
+                if scoreA == scoreB:
+                    aCry = sum(1 for a in aLog.attempts if a.outcome == "runs_away_crying")
+                    bCry = sum(1 for a in bLog.attempts if a.outcome == "runs_away_crying")
+                    if aCry != bCry:
+                        winner = A if aCry > bCry else B
+                    else:
+                        winner = A if random.random() < 0.5 else B
+                else:
+                    winner = A if scoreA > scoreB else B
+                match.details = MatchDetails(
+                    aLog=aLog, bLog=bLog, scoreA=scoreA, scoreB=scoreB,
+                    winnerId=winner.id,
+                    highlights={"aBest": aLog.highlights.get("most_successful"),
+                                "aWorst": aLog.highlights.get("least_successful"),
+                                "bBest": bLog.highlights.get("most_successful"),
+                                "bWorst": bLog.highlights.get("least_successful")}
+                )
+                match.winner = Slot(id=winner.id, name=winner.name)
+                match.summary = f"{A.name}: {scoreA} • {B.name}: {scoreB}"
+            # tiny delay so the UI can show progress
+            yield r_idx, m_idx, rounds
 
-/** Offline simulator for testing without API key */
-function offlineSim(name) {
-  const attempts = Array.from({ length: 10 }, (_, i) => {
-    const r = Math.random();
-    const outcome = r < 0.15 ? "runs_away_crying"
-      : r < 0.45 ? "runs_away"
-      : r < 0.7 ? "walks_away"
-      : r < 0.9 ? "defends"
-      : "stays_put";
-    const snippets = {
-      runs_away_crying: `${name} whispers a name from the void; the target bolts sobbing`,
-      runs_away: `${name} looms from fog; the target sprints`,
-      walks_away: `${name} rattles a sign; the target just stands and leaves`,
-      defends: `${name} gets pelted with the man's thermos`,
-      stays_put: `${name} flickers; the target stays stubbornly seated`,
-    };
-    return { attempt: i + 1, outcome, notes: snippets[outcome] };
-  });
-  return {
-    attempts,
-    highlights: {
-      most_successful: attempts.find(a => a.outcome === "runs_away_crying")?.notes || attempts.find(a => a.outcome === "runs_away")?.notes || attempts[0].notes,
-      least_successful: attempts.reverse().find(a => a.outcome === "stays_put" || a.outcome === "defends")?.notes || attempts[attempts.length - 1].notes,
+# --------------------------
+# UI
+# --------------------------
+st.set_page_config(page_title="Cryptid Scare Bracket (Streamlit)", page_icon="👻", layout="wide")
+st.title("👻 Cryptid Scare Bracket")
+
+with st.sidebar:
+    st.header("Simulation Settings")
+    use_offline = st.toggle("Use Offline Simulator", value=True, help="Test without calling OpenAI.")
+    api_key = st.text_input("OpenAI API key", type="password", disabled=use_offline)
+    model = st.selectbox("Model", ["gpt-4o-mini","gpt-4o","gpt-4.1-mini"], index=0, disabled=use_offline)
+    temperature = st.slider("Creativity (temperature)", 0.0, 2.0, 0.7, 0.1)
+
+col_setup, col_run = st.columns([2,1])
+with col_setup:
+    st.subheader("Setup")
+    size = st.selectbox("Bracket size", [8,16], index=0)
+    st.caption("Enter exactly this many cryptids.")
+
+    if "cryptids" not in st.session_state:
+        st.session_state.cryptids = []
+
+    def reset_for_size():
+        st.session_state.cryptids = []
+
+    if st.button("Reset entries", on_click=reset_for_size, type="secondary"):
+        pass
+
+    # Entry helpers
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("Add empty slot"):
+            if len(st.session_state.cryptids) < size:
+                st.session_state.cryptids.append({"id": uid("c"), "name": "", "blurb": ""})
+    with c2:
+        if st.button("Quick-fill samples"):
+            picks = shuffle(SAMPLE_CRYPTIDS)[:size]
+            st.session_state.cryptids = [{"id": uid("c"), "name": n, "blurb": b} for n,b in picks]
+    with c3:
+        paste = st.text_area("Paste one name per line", height=100, placeholder="Mothman\nBigfoot\nWendigo")
+        if st.button("Import pasted list"):
+            lines = [ln.strip() for ln in paste.splitlines() if ln.strip()]
+            if lines:
+                st.session_state.cryptids = [{"id": uid("c"), "name": ln, "blurb": ""} for ln in lines[:size]]
+
+    # Editable grid
+    for i in range(len(st.session_state.cryptids)):
+        with st.expander(f"#{i+1} – {st.session_state.cryptids[i]['name'] or 'Unnamed'}", expanded=True):
+            st.session_state.cryptids[i]["name"] = st.text_input("Name", key=f"name_{i}", value=st.session_state.cryptids[i]["name"])
+            st.session_state.cryptids[i]["blurb"] = st.text_area("Optional blurb/lore", key=f"blurb_{i}", value=st.session_state.cryptids[i]["blurb"])
+            if st.button("Remove", key=f"rm_{i}"):
+                st.session_state.cryptids.pop(i)
+                st.experimental_rerun()
+
+    st.caption(f"Slots used: {len(st.session_state.cryptids)}/{size}")
+
+with col_run:
+    st.subheader("Run")
+    can_generate = len([c for c in st.session_state.cryptids if c.get("name","").strip()]) == size
+    if st.button("Generate bracket", disabled=not can_generate):
+        cleaned = st.session_state.cryptids[:size]
+        shuffled = shuffle(cleaned)
+        entrants = [Entrant(id=c["id"], name=c["name"].strip(), blurb=c.get("blurb","").strip(), seed=i+1) for i,c in enumerate(shuffled)]
+        st.session_state.entrants = entrants
+        st.session_state.rounds = build_rounds(entrants)
+        st.session_state.results_ready = False
+
+    if "entrants" in st.session_state and st.session_state.get("rounds"):
+        start = st.button("Start simulation", disabled=(not use_offline and not api_key))
+        if start:
+            with st.status("Running tournament…", expanded=True) as status:
+                for r_idx, m_idx, rounds in simulate_tournament(
+                    st.session_state.entrants, use_offline, api_key, model, temperature
+                ):
+                    status.update(label=f"Round {r_idx+1}, Match {m_idx+1} complete")
+                    st.session_state.rounds = rounds
+                    time.sleep(0.05)
+                status.update(label="Tournament complete! 🏆")
+                st.session_state.results_ready = True
+
+# --------------------------
+# Bracket rendering
+# --------------------------
+def highlight(text):
+    st.markdown(f"<div style='background:#f6f7fb;border-radius:10px;padding:8px;font-size:12px;color:#334'>"+text+"</div>", unsafe_allow_html=True)
+
+def render_match(m: Match, rounds: List[Round], is_final: bool):
+    A = resolve_slot(m.a, rounds)
+    B = resolve_slot(m.b, rounds)
+    win = m.winner.id if m.winner else None
+    st.markdown(f"**{A.name}** vs **{B.name}**")
+    if m.winner:
+        st.markdown(f"*Summary:* {m.summary}")
+        # highlights
+        d = m.details
+        if d:
+            c1, c2 = st.columns(2)
+            with c1:
+                if d.highlights.get("aBest"):
+                    highlight(f"**{A.name} – Best:** {d.highlights['aBest']}")
+                if d.highlights.get("aWorst"):
+                    highlight(f"**{A.name} – Tough moment:** {d.highlights['aWorst']}")
+            with c2:
+                if is_final:
+                    if d.highlights.get("bBest"):
+                        highlight(f"**{B.name} – Best:** {d.highlights['bBest']}")
+                    if d.highlights.get("bWorst"):
+                        highlight(f"**{B.name} – Tough moment:** {d.highlights['bWorst']}")
+        st.success(f"Winner: {m.winner.name}")
+
+if st.session_state.get("rounds"):
+    st.subheader("Bracket")
+    rounds = st.session_state.rounds
+    cols = st.columns(len(rounds))
+    for i, rnd in enumerate(rounds):
+        with cols[i]:
+            st.markdown(f"### {'Final' if i == len(rounds)-1 else f'Round {i+1}'}")
+            for m in rnd.matches:
+                with st.container(border=True):
+                    render_match(m, rounds, is_final=(i==len(rounds)-1))
+
+# Export
+if st.session_state.get("rounds") and st.session_state.get("entrants"):
+    data = {
+        "entrants": [e.__dict__ for e in st.session_state.entrants],
+        "rounds": [
+            {
+                "matches": [
+                    {
+                        "id": m.id,
+                        "a": m.a.__dict__,
+                        "b": m.b.__dict__,
+                        "winner": m.winner.__dict__ if m.winner else None,
+                        "summary": m.summary,
+                        "details": None,  # keep export small; could include if desired
+                    }
+                    for m in rnd.matches
+                ]
+            } for rnd in st.session_state.rounds
+        ]
     }
-  };
-}
-
-async function callOpenAI({ apiKey, model, temperature, prompt, signal }) {
-  const body = {
-    model: model || "gpt-4o-mini",
-    temperature: typeof temperature === "number" ? temperature : 0.7,
-    response_format: { type: "json_object" },
-    messages: [
-      { role: "system", content: "You are an impartial simulation engine. Always return STRICT JSON that matches the schema with allowed outcome values only." },
-      { role: "user", content: prompt }
-    ],
-  };
-
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify(body),
-    signal,
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`OpenAI error ${res.status}: ${text}`);
-  }
-  const data = await res.json();
-  const msg = data.choices?.[0]?.message?.content;
-  if (!msg) throw new Error("No content from OpenAI");
-  try {
-    const parsed = JSON.parse(msg);
-    // lightweight validation
-    if (!parsed.attempts || !Array.isArray(parsed.attempts)) throw new Error("Invalid JSON (attempts missing)");
-    parsed.attempts.forEach((a, i) => {
-      if (!OUTCOMES.includes(a.outcome)) throw new Error(`Bad outcome at attempt ${i + 1}`);
-    });
-    return parsed;
-  } catch (e) {
-    console.warn("Parse error; raw=", msg);
-    throw e;
-  }
-}
-
-export default function CryptidScareBracket() {
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem("cryptid_api_key") || "");
-  const [model, setModel] = useState("gpt-4o-mini");
-  const [temperature, setTemperature] = useState(0.7);
-  const [useOffline, setUseOffline] = useState(false);
-
-  const [size, setSize] = useState(8); // 8 or 16
-  const [cryptids, setCryptids] = useState(/** @type {Cryptid[]} */([]));
-  const [entrants, setEntrants] = useState(/** @type {Entrant[]} */([]));
-  const [rounds, setRounds] = useState(/** @type {Round[]} */([]));
-
-  const [running, setRunning] = useState(false);
-  const [logMsg, setLogMsg] = useState("");
-  const [error, setError] = useState("");
-  const abortRef = useRef(/** @type {AbortController|null} */(null));
-
-  // Persist API key
-  useEffect(() => { if (apiKey) localStorage.setItem("cryptid_api_key", apiKey); }, [apiKey]);
-
-  // Derived: can start
-  const canGenerate = useMemo(() => cryptids.filter(c => c.name?.trim()).length === size, [cryptids, size]);
-  const canRun = useMemo(() => rounds.length > 0 && entrants.length === size, [rounds, entrants, size]);
-
-  function addCryptid() {
-    if (cryptids.length >= size) return;
-    setCryptids(prev => [...prev, { id: uid("c"), name: "", blurb: "" }]);
-  }
-  function removeCryptid(id) { setCryptids(prev => prev.filter(c => c.id !== id)); }
-  function updateCryptid(id, patch) { setCryptids(prev => prev.map(c => c.id === id ? { ...c, ...patch } : c)); }
-
-  function fillSamples() {
-    const picks = shuffle(SAMPLE_CRYPTIDS).slice(0, size).map((c) => ({ id: uid("c"), ...c }));
-    setCryptids(picks);
-  }
-
-  function importList(text) {
-    const lines = text.split(/\n+/).map(s => s.trim()).filter(Boolean).slice(0, size);
-    if (!lines.length) return;
-    setCryptids(lines.map((name) => ({ id: uid("c"), name })));
-  }
-
-  function exportTournament() {
-    const payload = { entrants, rounds };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url; a.download = `cryptid_bracket_${size}.json`; a.click();
-    URL.revokeObjectURL(url);
-  }
-
-  function generateBracket() {
-    setError("");
-    const cleaned = cryptids.filter(c => c.name?.trim()).slice(0, size);
-    if (cleaned.length !== size) { setError(`Need exactly ${size} cryptids to generate.`); return; }
-    const shuffled = shuffle(cleaned).map((c, i) => ({ id: c.id, name: c.name.trim(), blurb: c.blurb?.trim() || "", seed: i + 1 }));
-    setEntrants(shuffled);
-    setRounds(buildRounds(shuffled));
-  }
-
-  function getBlurbById(id) { return entrants.find(e => e.id === id)?.blurb || ""; }
-
-  async function simulateTournament() {
-    setError("");
-    if (!useOffline && !apiKey) { setError("Add your OpenAI API key in Settings or enable Offline Simulator."); return; }
-    if (!canRun) { setError("Generate the bracket first."); return; }
-
-    setRunning(true);
-    setLogMsg("Starting simulations…");
-
-    const mutableRounds = JSON.parse(JSON.stringify(rounds));
-    const controller = new AbortController();
-    abortRef.current = controller;
-
-    try {
-      for (let r = 0; r < mutableRounds.length; r++) {
-        const isFinal = r === mutableRounds.length - 1; // last round
-        for (let m = 0; m < mutableRounds[r].matches.length; m++) {
-          const match = mutableRounds[r].matches[m];
-          const A = resolveSlot(match.a, mutableRounds);
-          const B = resolveSlot(match.b, mutableRounds);
-          setLogMsg(`Round ${r + 1}: ${A.name} vs ${B.name}`);
-
-          // Run simulation
-          /** @type {SimulationJSON} */
-          let aLog; /** @type {SimulationJSON|undefined} */
-          let bLog; 
-
-          if (useOffline) {
-            aLog = offlineSim(A.name);
-            if (isFinal) bLog = offlineSim(B.name);
-          } else {
-            if (!isFinal) {
-              const prompt = promptForManScenario(A, getBlurbById(A.id));
-              aLog = await callOpenAI({ apiKey, model, temperature, prompt, signal: controller.signal });
-            } else {
-              const promptA = promptForMonsterVsMonster(A, getBlurbById(A.id), B, getBlurbById(B.id));
-              const promptB = promptForMonsterVsMonster(B, getBlurbById(B.id), A, getBlurbById(A.id));
-              aLog = await callOpenAI({ apiKey, model, temperature, prompt: promptA, signal: controller.signal });
-              bLog = await callOpenAI({ apiKey, model, temperature, prompt: promptB, signal: controller.signal });
-            }
-          }
-
-          const scoreA = computeScore(aLog);
-          const scoreB = isFinal ? computeScore(bLog) : 0;
-
-          // Winner logic; tie-breakers
-          let winner = A; let summary = "";
-          if (!isFinal) {
-            winner = scoreA > 0 ? A : B; // if A fails (<=0), bench guy held or fought back: B advances
-            if (scoreA === 0) {
-              // coin flip
-              winner = Math.random() < 0.5 ? A : B;
-            }
-            summary = `${A.name} vs bench: ${scoreA} pts.`;
-          } else {
-            if (scoreA === scoreB) {
-              // tie-breaker by runs_away_crying count, then random
-              const aCry = aLog.attempts.filter(x => x.outcome === "runs_away_crying").length;
-              const bCry = bLog.attempts.filter(x => x.outcome === "runs_away_crying").length;
-              if (aCry !== bCry) winner = aCry > bCry ? A : B; else winner = Math.random() < 0.5 ? A : B;
-            } else {
-              winner = scoreA > scoreB ? A : B;
-            }
-            summary = `${A.name}: ${scoreA} • ${B.name}: ${scoreB}`;
-          }
-
-          /** @type {MatchDetails} */
-          const details = {
-            aLog,
-            bLog,
-            scoreA,
-            scoreB,
-            winnerId: winner.id,
-            highlights: {
-              aBest: aLog?.highlights?.most_successful,
-              aWorst: aLog?.highlights?.least_successful,
-              bBest: bLog?.highlights?.most_successful,
-              bWorst: bLog?.highlights?.least_successful,
-            }
-          };
-
-          match.details = details;
-          match.winner = { name: winner.name, id: winner.id, scoreA, scoreB, summary };
-          setRounds(JSON.parse(JSON.stringify(mutableRounds)));
-          await new Promise(res => setTimeout(res, 250)); // tiny UI breather
-        }
-      }
-      setLogMsg("Tournament complete! 🏆");
-    } catch (e) {
-      console.error(e);
-      setError(e.message || "Simulation failed");
-      setLogMsg("");
-    } finally {
-      setRunning(false);
-      abortRef.current = null;
-    }
-  }
-
-  function cancelRun() {
-    if (abortRef.current) {
-      abortRef.current.abort();
-      setRunning(false);
-      setLogMsg("Cancelled");
-    }
-  }
-
-  // UI helpers
-  const remaining = size - cryptids.length;
-
-  return (
-    <div className="min-h-screen w-full bg-gradient-to-b from-slate-50 to-white text-slate-900">
-      <header className="sticky top-0 z-10 backdrop-blur bg-white/70 border-b border-slate-200">
-        <div className="max-w-6xl mx-auto px-4 py-3 flex items-center gap-3">
-          <Ghost className="h-6 w-6" />
-          <h1 className="text-xl font-semibold">Cryptid Scare Bracket</h1>
-          <div className="ml-auto flex items-center gap-2">
-            <Button variant="secondary" size="sm" onClick={exportTournament} className="gap-2"><Download className="h-4 w-4"/>Export</Button>
-            <SettingsMenu apiKey={apiKey} setApiKey={setApiKey} model={model} setModel={setModel} temperature={temperature} setTemperature={setTemperature} useOffline={useOffline} setUseOffline={setUseOffline} />
-          </div>
-        </div>
-      </header>
-
-      <main className="max-w-6xl mx-auto px-4 py-6 space-y-8">
-        <section className="grid md:grid-cols-3 gap-6">
-          <Card className="md:col-span-2">
-            <CardHeader className="pb-2">
-              <CardTitle className="flex items-center gap-2"><Brackets className="h-5 w-5"/> Setup</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="grid sm:grid-cols-2 gap-4">
-                <div>
-                  <Label className="text-sm">Bracket size</Label>
-                  <Select value={String(size)} onValueChange={(v) => { setSize(Number(v)); setCryptids([]); setEntrants([]); setRounds([]); }}>
-                    <SelectTrigger className="mt-1"><SelectValue placeholder="Choose size"/></SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="8">Small (8)</SelectItem>
-                      <SelectItem value="16">Large (16)</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="flex items-center gap-3 pt-6">
-                  <Switch id="offline" checked={useOffline} onCheckedChange={setUseOffline} />
-                  <Label htmlFor="offline">Use Offline Simulator</Label>
-                </div>
-              </div>
-
-              <div className="flex flex-wrap gap-2">
-                <Button variant="secondary" size="sm" onClick={addCryptid} disabled={cryptids.length >= size} className="gap-2"><Ghost className="h-4 w-4"/>Add cryptid ({remaining} slots)</Button>
-                <Button variant="secondary" size="sm" onClick={fillSamples} className="gap-2"><Upload className="h-4 w-4"/>Quick-fill samples</Button>
-                <ImportList onImport={importList} />
-              </div>
-
-              <div className="grid md:grid-cols-2 gap-4">
-                {cryptids.map((c, idx) => (
-                  <div key={c.id} className="border rounded-2xl p-3 space-y-2 bg-white shadow-sm">
-                    <div className="flex items-center gap-3">
-                      <span className="text-xs px-2 py-0.5 rounded-full bg-slate-100">#{idx + 1}</span>
-                      <Input placeholder="Name (required)" value={c.name} onChange={(e) => updateCryptid(c.id, { name: e.target.value })} />
-                      <Button variant="ghost" size="icon" onClick={() => removeCryptid(c.id)}><Trash2 className="h-4 w-4"/></Button>
-                    </div>
-                    <Textarea placeholder="Optional blurb/lore to flavor the sim" value={c.blurb || ""} onChange={(e) => updateCryptid(c.id, { blurb: e.target.value })} className="text-sm"/>
-                  </div>
-                ))}
-              </div>
-
-              <div className="flex flex-wrap items-center gap-3 pt-1">
-                <Button disabled={!canGenerate} onClick={generateBracket} className="gap-2"><Brackets className="h-4 w-4"/>Generate bracket</Button>
-                {!canGenerate && <p className="text-sm text-slate-500">Enter exactly {size} cryptids.</p>}
-              </div>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="flex items-center gap-2"><Swords className="h-5 w-5"/> Run</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="text-sm text-slate-600">{logMsg || "Ready."}</div>
-              {error && (
-                <div className="flex items-start gap-2 text-red-600 text-sm">
-                  <AlertCircle className="h-4 w-4 mt-0.5"/> <span>{error}</span>
-                </div>
-              )}
-              <div className="flex flex-wrap gap-2">
-                <Button onClick={simulateTournament} disabled={!canRun || running} className="gap-2"><Play className="h-4 w-4"/>Start simulation</Button>
-                <Button onClick={cancelRun} disabled={!running} variant="secondary">Cancel</Button>
-              </div>
-              <div className="text-xs text-slate-500">{!useOffline && !apiKey && "Tip: Add your OpenAI API key (top right) or enable Offline Simulator."}</div>
-            </CardContent>
-          </Card>
-        </section>
-
-        {rounds.length > 0 && (
-          <section className="overflow-x-auto">
-            <div className="min-w-[900px] grid" style={{ gridTemplateColumns: `repeat(${rounds.length}, minmax(220px, 1fr))`, gap: "1rem" }}>
-              {rounds.map((round, rIdx) => (
-                <div key={rIdx} className="space-y-3">
-                  <h3 className="font-semibold text-slate-700">{rIdx === rounds.length - 1 ? "Final" : `Round ${rIdx + 1}`}</h3>
-                  {round.matches.map((m, mIdx) => (
-                    <MatchCard key={m.id} match={m} rounds={rounds} rIdx={rIdx} mIdx={mIdx} />
-                  ))}
-                </div>
-              ))}
-            </div>
-          </section>
-        )}
-      </main>
-
-      <footer className="max-w-6xl mx-auto px-4 py-8 text-xs text-slate-500">
-        Built for fun. Keep it spooky, not gory. 👻
-      </footer>
-    </div>
-  );
-}
-
-function MatchCard({ match, rounds, rIdx, mIdx }) {
-  const A = resolveSlot(match.a, rounds);
-  const B = resolveSlot(match.b, rounds);
-  const winnerId = match?.winner?.id;
-  const isFinal = rIdx === rounds.length - 1;
-
-  return (
-    <Card className={`relative ${winnerId ? "ring-1 ring-emerald-300" : ""}`}>
-      <CardHeader className="pb-2">
-        <CardTitle className="text-base flex items-center gap-2">
-          {isFinal ? <Trophy className="h-4 w-4"/> : <Swords className="h-4 w-4"/>}
-          <span>{A.name} vs {B.name}</span>
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-2">
-        <div className="grid grid-cols-2 gap-2 text-sm">
-          <div className={`rounded-lg px-2 py-1 ${winnerId === A.id ? "bg-emerald-50" : "bg-slate-50"}`}>{A.name}</div>
-          <div className={`rounded-lg px-2 py-1 text-right ${winnerId === B.id ? "bg-emerald-50" : "bg-slate-50"}`}>{B.name}</div>
-        </div>
-        {match?.winner && (
-          <div className="text-xs text-slate-600">
-            <div className="flex justify-between"><span>Summary</span><span className="font-medium">{match.winner.summary}</span></div>
-            <div className="mt-1 grid grid-cols-2 gap-2">
-              <Highlight label={`${A.name} – Best`} text={match.details?.highlights?.aBest} />
-              {isFinal && <Highlight label={`${B.name} – Best`} text={match.details?.highlights?.bBest} />}
-              <Highlight label={`${A.name} – Tough moment`} text={match.details?.highlights?.aWorst} />
-              {isFinal && <Highlight label={`${B.name} – Tough moment`} text={match.details?.highlights?.bWorst} />}
-            </div>
-          </div>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
-function Highlight({ label, text }) {
-  if (!text) return null;
-  return (
-    <div className="rounded-xl bg-slate-50 p-2">
-      <div className="text-[10px] uppercase tracking-wide text-slate-500">{label}</div>
-      <div className="text-xs text-slate-700 line-clamp-3">{text}</div>
-    </div>
-  );
-}
-
-function SettingsMenu({ apiKey, setApiKey, model, setModel, temperature, setTemperature, useOffline, setUseOffline }) {
-  const [open, setOpen] = useState(false);
-  return (
-    <>
-      <Button variant="secondary" size="sm" onClick={() => setOpen(true)} className="gap-2"><Settings2 className="h-4 w-4"/>Settings</Button>
-      {open && (
-        <div className="fixed inset-0 bg-black/30 flex items-center justify-center p-4" onClick={() => setOpen(false)}>
-          <div className="bg-white rounded-2xl shadow-xl w-full max-w-lg p-4" onClick={(e) => e.stopPropagation()}>
-            <div className="flex items-center gap-2 mb-2"><Settings2 className="h-5 w-5"/><h2 className="font-semibold">Simulation Settings</h2></div>
-            <div className="space-y-3">
-              <div>
-                <Label className="text-sm flex items-center gap-2"><KeyRound className="h-4 w-4"/> OpenAI API key</Label>
-                <Input type="password" placeholder="sk-..." value={apiKey} onChange={(e) => setApiKey(e.target.value)} className="mt-1"/>
-                <div className="text-xs text-slate-500 mt-1">Stored locally in your browser. For demos only.
-                </div>
-              </div>
-              <div className="grid sm:grid-cols-3 gap-3">
-                <div>
-                  <Label className="text-sm">Model</Label>
-                  <Select value={model} onValueChange={setModel}>
-                    <SelectTrigger className="mt-1"><SelectValue/></SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="gpt-4o-mini">gpt-4o-mini</SelectItem>
-                      <SelectItem value="gpt-4o">gpt-4o</SelectItem>
-                      <SelectItem value="gpt-4.1-mini">gpt-4.1-mini</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="sm:col-span-2">
-                  <Label className="text-sm">Creativity (temperature)</Label>
-                  <Input type="number" step="0.1" min="0" max="2" value={temperature} onChange={(e) => setTemperature(parseFloat(e.target.value))} className="mt-1"/>
-                </div>
-              </div>
-              <div className="flex items-center gap-2">
-                <Switch id="offline2" checked={useOffline} onCheckedChange={setUseOffline}/>
-                <Label htmlFor="offline2">Use Offline Simulator</Label>
-              </div>
-              <div className="pt-2 flex justify-end gap-2">
-                <Button variant="secondary" onClick={() => setOpen(false)}>Close</Button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-    </>
-  );
-}
-
-function ImportList({ onImport }) {
-  const [open, setOpen] = useState(false);
-  const [text, setText] = useState("");
-  return (
-    <>
-      <Button variant="secondary" size="sm" onClick={() => setOpen(true)} className="gap-2"><Upload className="h-4 w-4"/>Paste list</Button>
-      {open && (
-        <div className="fixed inset-0 bg-black/30 flex items-center justify-center p-4" onClick={() => setOpen(false)}>
-          <div className="bg-white rounded-2xl shadow-xl w-full max-w-lg p-4" onClick={(e) => e.stopPropagation()}>
-            <div className="flex items-center gap-2 mb-2"><Upload className="h-5 w-5"/><h2 className="font-semibold">Paste one name per line</h2></div>
-            <Textarea rows={10} placeholder={"e.g.\nMothman\nBigfoot\nWendigo"} value={text} onChange={(e) => setText(e.target.value)} />
-            <div className="pt-3 flex justify-end gap-2">
-              <Button variant="secondary" onClick={() => setOpen(false)}>Cancel</Button>
-              <Button onClick={() => { onImport(text); setOpen(false); }}>Import</Button>
-            </div>
-          </div>
-        </div>
-      )}
-    </>
-  );
-}
+    st.download_button("Export bracket JSON", data=json.dumps(data, indent=2), file_name="cryptid_bracket.json", mime="application/json")
