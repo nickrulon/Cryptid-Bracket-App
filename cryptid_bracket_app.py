@@ -261,69 +261,136 @@ def offline_sim(name: str) -> SimJSON:
 # --------------------------
 # Narrative builders (spooky + clear scoring)
 # --------------------------
-OUTCOME_VERBS = {
-    "runs_away": "runs",
-    "runs_away_crying": "runs, crying",
-    "defends": "fights back",
-    "stays_put": "refuses to budge",
-    "walks_away": "just walks off",
+OUTCOME_SENTENCES = {
+    "runs_away": [
+        "The Macho Man bolts, sprinting like cardio finally found religion.",
+        "The Macho Man breaks into a panicked 5K, no medal ceremony required.",
+        "The Macho Man abandons the bench with the dignity of a fast-moving shopping cart."
+    ],
+    "runs_away_crying": [
+        "The Macho Man flees in tears—salt water meets sweat in an unholy sports drink.",
+        "The Macho Man sprints away bawling; even the dog averts its eyes.",
+        "The Macho Man escapes, sobbing into the night like a siren with gym membership."
+    ],
+    "defends": [
+        "The Macho Man hurls a thermos with MLB aspirations.",
+        "The Macho Man squares up—thermos first, feelings second.",
+        "The Macho Man counterattacks with commuter-grade artillery."
+    ],
+    "stays_put": [
+        "The Macho Man sits immovable, patron saint of Stubborn Benches.",
+        "The Macho Man refuses to budge; gravity files an alliance.",
+        "The Macho Man remains seated, an oak with opinions."
+    ],
+    "walks_away": [
+        "The Macho Man stands and leaves like he’s quitting a bad movie.",
+        "The Macho Man wanders off, the world’s pettiest protest march of one.",
+        "The Macho Man drifts away, offended in slow motion."
+    ],
 }
-OUTCOME_TAGLINES = {
-    "runs_away": "— cardio was suddenly in season.",
-    "runs_away_crying": "— tears: the sport drink of terror.",
-    "defends": "— the thermos flies; dignity does not.",
-    "stays_put": "— stubbornness: nature’s least helpful amulet.",
-    "walks_away": "— the world’s pettiest protest.",
-}
+
+OUTCOME_SCORE_NOTE = "Scoring: runs_away=+1, runs_away_crying=+2, defends=-1, stays_put=-2, walks_away=0."
+
+def unique_sentence(outcome: Outcome, i: int) -> str:
+    bank = OUTCOME_SENTENCES[outcome]
+    return bank[i % len(bank)]
 
 def tallies_to_string(t: Counter) -> str:
-    parts = []
-    for k in ["runs_away_crying","runs_away","walks_away","defends","stays_put"]:
-        if t[k]: parts.append(f"{t[k]}× {k.replace('_',' ')}")
+    order = ["runs_away_crying","runs_away","walks_away","defends","stays_put"]
+    labels = {
+        "runs_away": "runs away",
+        "runs_away_crying": "runs away crying",
+        "defends": "defends himself",
+        "stays_put": "stays put",
+        "walks_away": "walks away",
+    }
+    parts = [f"{t[k]}× {labels[k]}" for k in order if t[k]]
     return ", ".join(parts) if parts else "no notable reactions"
 
-def attempt_lines(attempts: List[Attempt], attacker: str, defender: str) -> str:
+def attempt_lines(attempts: List[Attempt], attacker: str, defender_label: str) -> str:
+    # longform, one unique sentence per attempt + the model’s short note
     lines = []
-    for a in attempts:
-        verb = OUTCOME_VERBS[a.outcome]
-        quip = OUTCOME_TAGLINES[a.outcome]
-        lines.append(f"- **Attempt {a.attempt}**: {attacker} looms; {defender} {verb}. {quip} _({a.notes})._")
+    for idx, a in enumerate(attempts, start=1):
+        sentence = unique_sentence(a.outcome, idx)
+        # put the attacker up front; always refer to the target as The Macho Man (or defender_label in finals)
+        if defender_label == "The Macho Man":
+            perspective = f"**Attempt {idx}** — {attacker} advances; {sentence}"
+        else:
+            perspective = f"**Attempt {idx}** — {attacker} advances on {defender_label}; {sentence}"
+        # include the sim’s concise note for flavor
+        lines.append(f"- {perspective} _({a.notes})._")
     return "\n".join(lines)
 
-def round_match_narrative(A, B, details: MatchDetails, is_final: bool) -> str:
+def round_match_narrative(A, B, details: MatchDetails, is_final: bool, round_number: Optional[int] = None) -> str:
     if not is_final:
-        defender = "the macho man on the bench"
         t = Counter([a.outcome for a in details.aLog.attempts])
         score = details.scoreA
-        intro = f"Under a jaundiced streetlamp, **{A.name}** tries ten times to unsettle **{defender}**. The dog offers moral support and zero cardio."
-        attempts_text = attempt_lines(details.aLog.attempts, A.name, "he")
+        attempts_text = attempt_lines(details.aLog.attempts, A.name, "The Macho Man")
         tally = tallies_to_string(t)
-        return textwrap.dedent(f"""
-        **{A.name} vs The Bench**
 
-        {intro}
+        # Summary block FIRST, then story
+        header = f"### Round {round_number}: **{A.name} vs The Macho Man**"
+        summary = (
+            f"**Overview (10 attempts):** {tally} → **Score {score}**  \n"
+            f"{OUTCOME_SCORE_NOTE}\n\n"
+            f"**Best moment:** {details.highlights.get('aBest') or 'A rumor crawls under the skin; sprinting ensues.'}  \n"
+            f"**Tough moment:** {details.highlights.get('aWorst') or 'A thermos achieves escape velocity.'}"
+        )
+        prose_intro = (
+            f"Night swallows the park. **{A.name}** steps from the margins of folklore, aiming all dread at "
+            f"**The Macho Man**, who clutches his thermos like it’s certified ghost-proof. The dog provides moral support and unhelpful commentary."
+        )
+        result_line = f"**Result:** {'**'+A.name+'** advances.' if details.winnerId == A.id else '**'+B.name+'** advances.'}"
+
+        return textwrap.dedent(f"""
+        {header}
+
+        {summary}
+
+        {prose_intro}
 
         {attempts_text}
 
-        **Tally (10 attempts):** {tally}.  
-        **Score:** {score} (runs_away=+1, runs_away_crying=+2, defends=-1, stays_put=-2, walks_away=0)
-
-        **Best moment:** {details.highlights.get('aBest') or 'A rumor crawled under the skin; a sprint followed.'}  
-        **Tough moment:** {details.highlights.get('aWorst') or 'A thermos achieved escape velocity.'}
-
-        **Result:** {details.winnerId == A.id and f"{A.name} advances" or f"{B.name} advances"}.
+        {result_line}
         """).strip()
     else:
         # Final: both attack each other
         tA = Counter([a.outcome for a in details.aLog.attempts])
-        tB = Counter([a.outcome for a in details.bLog.attempts]) if details.bLog else Counter()
-        intro = f"In the final, the bench seats hubris itself: **{A.name}** and **{B.name}** trade frights under trees that have seen better centuries."
-        a_lines = attempt_lines(details.aLog.attempts, A.name, B.name)
-        b_lines = attempt_lines(details.bLog.attempts, B.name, A.name) if details.bLog else ""
-        return textwrap.dedent(f"""
-        **Final: {A.name} vs {B.name}**
+        tB = Counter([a.outcome for a in (details.bLog.attempts if details.bLog else [])])
 
-        {intro}
+        a_lines = attempt_lines(details.aLog.attempts, A.name, B.name)
+        b_lines = attempt_lines(details.bLog.attempts if details.bLog else [], B.name, A.name) if details.bLog else ""
+
+        header = f"### Final: **{A.name} vs {B.name}**"
+        overview = (
+            f"**Tallies (10 attempts each):**  \n"
+            f"- {A.name}: {tallies_to_string(tA)} → **Score {details.scoreA}**  \n"
+            f"- {B.name}: {tallies_to_string(tB)} → **Score {details.scoreB}**  \n"
+            f"{OUTCOME_SCORE_NOTE}"
+        )
+        flavor = (
+            f"Under trees that remember older fears, the bench hosts an ego summit. "
+            f"**{A.name}** and **{B.name}** trade hauntings like collectors swapping cursed stamps."
+        )
+        best = (
+            f"**Best moments:**  \n"
+            f"- {A.name}: {details.highlights.get('aBest') or 'A shriek like cold iron on glass.'}  \n"
+            f"- {B.name}: {details.highlights.get('bBest') or 'A shadow that forgets to be two-dimensional.'}"
+        )
+        tough = (
+            f"**Tough moments:**  \n"
+            f"- {A.name}: {details.highlights.get('aWorst') or 'Confidence meets counter-roar.'}  \n"
+            f"- {B.name}: {details.highlights.get('bWorst') or 'A brave face with trembly edges.'}"
+        )
+        winner_name = A.name if details.winnerId == A.id else B.name
+        result_line = f"**Result:** **{winner_name}** claims the trophy and immediately misplaces it in a haunted lost-and-found."
+
+        return textwrap.dedent(f"""
+        {header}
+
+        {overview}
+
+        {flavor}
 
         **{A.name} attacks {B.name}:**  
         {a_lines}
@@ -331,20 +398,13 @@ def round_match_narrative(A, B, details: MatchDetails, is_final: bool) -> str:
         **{B.name} attacks {A.name}:**  
         {b_lines}
 
-        **Tallies (10 attempts each):**  
-        - {A.name}: {tallies_to_string(tA)} → **Score {details.scoreA}**  
-        - {B.name}: {tallies_to_string(tB)} → **Score {details.scoreB}**
+        {best}
 
-        **Best moments:**  
-        - {A.name}: {details.highlights.get('aBest') or 'A shriek like cold iron on glass.'}  
-        - {B.name}: {details.highlights.get('bBest') or 'A shadow that forgot to be two-dimensional.'}
+        {tough}
 
-        **Tough moments:**  
-        - {A.name}: {details.highlights.get('aWorst') or 'Confidence met counter-roar.'}  
-        - {B.name}: {details.highlights.get('bWorst') or 'A brave face with trembly edges.'}
-
-        **Result:** **{(A.name if details.winnerId == (A.id) else B.name)}** claims the trophy and immediately misplaces it in a haunted lost-and-found.
+        {result_line}
         """).strip()
+
 
 # --------------------------
 # Round-by-round simulation
@@ -394,14 +454,12 @@ def simulate_round(round_index: int, entrants: List[Entrant], rounds: List[Round
         B = resolve_slot(match.b, rounds)
         details = simulate_match(A, B, is_final, use_offline, api_key, model, temperature, blurbs)
         match.details = details
-        # set winner & summary
         winner = A if details.winnerId == A.id else B
         match.winner = Slot(id=winner.id, name=winner.name)
         match.summary = (f"{A.name}: {details.scoreA} • {B.name}: {details.scoreB}" if is_final
-                         else f"{A.name} vs bench: {details.scoreA} pts.")
-        # narrative
-        narratives.append(round_match_narrative(A, B, details, is_final))
-        # tiny UI pause
+                         else f"{A.name} vs The Macho Man: {details.scoreA} pts.")
+        # narrative (with round number for clarity)
+        narratives.append(round_match_narrative(A, B, details, is_final, round_number=(round_index + 1 if not is_final else None)))
         time.sleep(0.05)
     return rounds, narratives
 
@@ -418,7 +476,10 @@ with st.sidebar:
     model = st.selectbox("Model", ["gpt-4o-mini","gpt-4o","gpt-4.1-mini"], index=0, disabled=use_offline)
     temperature = st.slider("Creativity (temperature)", 0.0, 2.0, 0.7, 0.1)
 
-col_setup, col_run = st.columns([2,1])
+# --------------------------
+# Top controls: Setup (left) and Actions (right)
+# --------------------------
+col_setup, col_run = st.columns([2,1], vertical_alignment="top")
 with col_setup:
     st.subheader("Setup")
     size = st.selectbox("Bracket size", [8,16], index=0)
@@ -427,24 +488,17 @@ with col_setup:
     # session bootstrap
     if "cryptids" not in st.session_state:
         st.session_state.cryptids: List[Dict[str,str]] = []
-
     if "entrants" not in st.session_state:
         st.session_state.entrants: List[Entrant] = []
-
     if "rounds" not in st.session_state:
         st.session_state.rounds: List[Round] = []
-
     if "curr_round_idx" not in st.session_state:
-        st.session_state.curr_round_idx: Optional[int] = None  # None until bracket generated
-
+        st.session_state.curr_round_idx: Optional[int] = None
     if "narratives_log" not in st.session_state:
-        # list[str]; one long narrative per match, appended round-by-round
         st.session_state.narratives_log: List[str] = []
 
-    # helpers
     def reset_entries():
         st.session_state.cryptids = []
-
     def hard_reset_tournament():
         st.session_state.entrants = []
         st.session_state.rounds = []
@@ -474,12 +528,8 @@ with col_setup:
     # editable rows
     for i in range(len(st.session_state.cryptids)):
         with st.expander(f"#{i+1} – {st.session_state.cryptids[i]['name'] or 'Unnamed'}", expanded=True):
-            st.session_state.cryptids[i]["name"] = st.text_input(
-                "Name", key=f"name_{i}", value=st.session_state.cryptids[i]["name"]
-            )
-            st.session_state.cryptids[i]["blurb"] = st.text_area(
-                "Optional blurb / lore", key=f"blurb_{i}", value=st.session_state.cryptids[i]["blurb"]
-            )
+            st.session_state.cryptids[i]["name"] = st.text_input("Name", key=f"name_{i}", value=st.session_state.cryptids[i]["name"])
+            st.session_state.cryptids[i]["blurb"] = st.text_area("Optional blurb / lore", key=f"blurb_{i}", value=st.session_state.cryptids[i]["blurb"])
             if st.button("Remove", key=f"rm_{i}"):
                 st.session_state.cryptids.pop(i)
                 st.experimental_rerun()
@@ -487,39 +537,64 @@ with col_setup:
     st.caption(f"Slots used: {len(st.session_state.cryptids)}/{size}")
 
 with col_run:
-    st.subheader("Run")
-    can_generate = len([c for c in st.session_state.cryptids if c.get("name", "").strip()]) == size
-
+    st.subheader("Actions")
+    can_generate = len([c for c in st.session_state.cryptids if c.get("name","").strip()]) == size
     if st.button("Generate bracket", disabled=not can_generate):
         cleaned = st.session_state.cryptids[:size]
         shuffled = shuffle(cleaned)
-        entrants = [
-            Entrant(id=c["id"], name=c["name"].strip(), blurb=c.get("blurb", "").strip(), seed=i + 1)
-            for i, c in enumerate(shuffled)
-        ]
+        entrants = [Entrant(id=c["id"], name=c["name"].strip(), blurb=c.get("blurb","").strip(), seed=i+1) for i,c in enumerate(shuffled)]
         st.session_state.entrants = entrants
         st.session_state.rounds = build_rounds(entrants)
         st.session_state.curr_round_idx = 0
         st.session_state.narratives_log = []
-        st.success("Bracket generated. Press **Next round** to begin.")
+        st.success("Bracket generated. Use **Next round** below.")
 
-    # next round button (stepwise)
+    # Next round sits near bracket & stories, so we just show reminders here
+    st.button("Reset tournament", type="secondary", on_click=lambda: (
+        st.session_state.update({"entrants": [], "rounds": [], "curr_round_idx": None, "narratives_log": []})
+    ))
+
+# --------------------------
+# Results + Bracket + Next button in one band (top)
+# --------------------------
+st.subheader("Results & Bracket")
+
+# Controls + Bracket + Stories side-by-side
+left, right = st.columns([1.4, 1.0], vertical_alignment="top")
+
+with left:
+    # NEXT ROUND button lives here beside the bracket
     next_disabled = not (st.session_state.get("rounds") and st.session_state.curr_round_idx is not None)
     if st.button("▶️ Next round", disabled=next_disabled or (st.session_state.curr_round_idx is not None and st.session_state.curr_round_idx >= len(st.session_state.rounds)) or (not use_offline and not api_key)):
         ridx = st.session_state.curr_round_idx
         rounds = st.session_state.rounds
         entrants = st.session_state.entrants
-
-        updated_rounds, narratives = simulate_round(
-            ridx, entrants, rounds, use_offline, api_key, model, temperature
-        )
+        updated_rounds, narratives = simulate_round(ridx, entrants, rounds, use_offline, api_key, model, temperature)
         st.session_state.rounds = updated_rounds
         st.session_state.narratives_log.extend(narratives)
         st.session_state.curr_round_idx = ridx + 1
         if st.session_state.curr_round_idx >= len(st.session_state.rounds):
             st.success("Tournament complete! 🏆")
 
-    st.button("Reset tournament", type="secondary", on_click=hard_reset_tournament)
+    # Bracket at top
+    if st.session_state.get("rounds"):
+        rounds = st.session_state.rounds
+        cols = st.columns(len(rounds))
+        for i, rnd in enumerate(rounds):
+            with cols[i]:
+                st.markdown(f"### {'Final' if i == len(rounds)-1 else f'Round {i+1}'}")
+                for m in rnd.matches:
+                    with st.container(border=True):
+                        render_match(m, rounds, is_final=(i == len(rounds) - 1))
+
+with right:
+    # Stories on the right, newest on top
+    if st.session_state.get("narratives_log"):
+        st.markdown("### 📖 Round Recaps")
+        for idx, text in enumerate(reversed(st.session_state.narratives_log), 1):
+            with st.expander(f"Story {idx}", expanded=(idx == 1)):
+                st.markdown(text)
+
 
 # --------------------------
 # Bracket rendering
